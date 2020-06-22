@@ -13,7 +13,7 @@ import edalize
 import glob
 
 from toolchain import Toolchain
-from utils import Timed
+from utils import Timed, get_vivado_max_freq, have_exec
 
 
 class Vivado(Toolchain):
@@ -24,6 +24,7 @@ class Vivado(Toolchain):
         Toolchain.__init__(self, rootdir)
         self.toolchain = 'vivado'
         self.synthtool = 'vivado'
+        self.synthoptions = []
         self.files = []
         self.edam = None
         self.backend = None
@@ -60,26 +61,29 @@ class Vivado(Toolchain):
         runs_dir = self.out_dir + "/" + self.project_name + ".runs"
         synth_times = self.get_vivado_runtimes(runs_dir + '/synth_1/runme.log')
         impl_times = self.get_vivado_runtimes(runs_dir + '/impl_1/runme.log')
-        total_runtime = 0
         for t in synth_times:
-            self.add_runtime(t, synth_times[t], parent='logs')
-            total_runtime += float(synth_times[t])
+            self.add_runtime(t, synth_times[t])
         for t in impl_times:
-            self.add_runtime(t, impl_times[t], parent='logs')
-            total_runtime += float(impl_times[t])
-        self.add_runtime('total', total_runtime, parent='logs')
+            self.add_runtime(t, impl_times[t])
 
     def run(self):
-
-        with Timed(self, 'bitstream'):
+        with Timed(self, 'prepare'):
             os.makedirs(self.out_dir, exist_ok=True)
             for f in self.srcs:
-                self.files.append(
-                    {
-                        'name': os.path.realpath(f),
-                        'file_type': 'verilogSource'
-                    }
-                )
+                if f.endswith(".vhd") or f.endswith(".vhdl"):
+                    self.files.append(
+                        {
+                            'name': os.path.realpath(f),
+                            'file_type': 'vhdlSource'
+                        }
+                    )
+                elif f.endswith(".v"):
+                    self.files.append(
+                        {
+                            'name': os.path.realpath(f),
+                            'file_type': 'verilogSource'
+                        }
+                    )
 
             self.files.append(
                 {
@@ -112,6 +116,7 @@ class Vivado(Toolchain):
                                 'part': chip,
                                 'synth': self.synthtool,
                                 'vivado-settings': vivado_settings,
+                                'yosys_synth_options': self.synthoptions,
                             }
                     }
             }
@@ -120,84 +125,25 @@ class Vivado(Toolchain):
                 edam=self.edam, work_root=self.out_dir
             )
             self.backend.configure("")
+
+        with Timed(self, 'total'):
             self.backend.build()
 
-            self.add_runtimes()
+        self.add_runtimes()
 
     @staticmethod
     def seedable():
         return False
 
-    @staticmethod
     def check_env():
         return {
             'vivado': have_exec('vivado'),
         }
 
-    def get_max_freq(self, report_file):
-        processing = False
-
-        group = ""
-        delay = ""
-        freq = 0
-        freqs = {}
-        path_type = None
-
-        with open(report_file, 'r') as fp:
-            for l in fp:
-
-                if l.startswith("Slack"):
-                    if '(MET)' in l:
-                        violation = 0.0
-                    else:
-                        violation = float(
-                            l.split(':')[1].split()[0].strip().strip('ns')
-                        )
-                    processing = True
-
-                if processing is True:
-                    fields = l.split()
-                    if len(fields) > 1 and fields[1].startswith('----'):
-                        processing = False
-                        # check if this is a timing we want
-                        if group not in requirement.split():
-                            continue
-                        if group not in freqs:
-                            freqs[group] = dict()
-                            freqs[group]['actual'] = freq
-                            freqs[group]['requested'] = requested_freq
-                            freqs[group]['met'] = freq >= requested_freq
-                            freqs[group]['{}_violation'.format(
-                                path_type.lower()
-                            )] = violation
-                            path_type = None
-                        if path_type is not None:
-                            freqs[group]['{}_violation'.format(
-                                path_type.lower()
-                            )] = violation
-
-                    data = l.split(':')
-                    if len(data) > 1:
-                        if data[0].strip() == 'Data Path Delay':
-                            delay = data[1].split()[0].strip('ns')
-                            freq = 1e9 / float(delay)
-                        if data[0].strip() == 'Path Group':
-                            group = data[1].strip()
-                        if data[0].strip() == 'Requirement':
-                            requirement = data[1].strip()
-                            r = float(requirement.split()[0].strip('ns'))
-                            if r != 0.0:
-                                requested_freq = 1e9 / r
-                        if data[0].strip() == 'Path Type':
-                            ptype = data[1].strip()
-                            if path_type != ptype.split()[0]:
-                                path_type = ptype.split()[0]
-        return freqs
-
     def max_freq(self):
         report_file_pattern = self.out_dir + "/" + self.project_name + '.runs/impl_1/*_timing_summary_routed.rpt'
         report_file = glob.glob(report_file_pattern).pop()
-        return self.get_max_freq(report_file)
+        return get_vivado_max_freq(report_file)
 
     def vivado_resources(self, report_file):
         with open(report_file, 'r') as fp:
@@ -268,14 +214,17 @@ class Vivado(Toolchain):
             "DFF": str(dff),
             "BRAM": str(bram),
             "CARRY": str(carry),
-            "GLB": "unsupported",
+            "GLB": None,
             "PLL": str(pll),
             "IOB": str(iob),
         }
         return ret
 
-    def versions(self):
+    def vivado_ver(self):
         return self.backend.get_version()
+
+    def versions(self):
+        return {"vivado": self.vivado_ver()}
 
 
 class VivadoYosys(Vivado):
@@ -285,7 +234,15 @@ class VivadoYosys(Vivado):
     def __init__(self, rootdir):
         Vivado.__init__(self, rootdir)
         self.synthtool = 'yosys'
+        self.synthoptions = ['-iopad', '-arch xc7', '-abc9', '-flatten']
         self.toolchain = 'yosys-vivado'
+
+    @staticmethod
+    def check_env():
+        return {
+            'yosys': have_exec('yosys'),
+            'vivado': have_exec('vivado'),
+        }
 
     @staticmethod
     def yosys_ver():
@@ -318,12 +275,12 @@ class VivadoYosys(Vivado):
         impl_times = self.get_vivado_runtimes(runs_dir + '/impl_1/runme.log')
         total_runtime = 0
         for t in synth_times:
-            self.add_runtime(t, synth_times[t], parent='logs')
+            self.add_runtime(t, synth_times[t])
             total_runtime += float(synth_times[t])
         for t in impl_times:
-            self.add_runtime(t, impl_times[t], parent='logs')
+            self.add_runtime(t, impl_times[t])
             total_runtime += float(impl_times[t])
-        self.add_runtime('total', total_runtime, parent='logs')
+        self.add_runtime('total', total_runtime)
 
     def resources(self):
         report_file_pattern = self.out_dir + "/*_utilization_placed.rpt"
@@ -333,10 +290,7 @@ class VivadoYosys(Vivado):
     def max_freq(self):
         report_file_pattern = self.out_dir + "/*_timing_summary_routed.rpt"
         report_file = glob.glob(report_file_pattern).pop()
-        return super(VivadoYosys, self).get_max_freq(report_file)
+        return get_vivado_max_freq(report_file)
 
     def versions(self):
-        return {
-            'yosys': self.yosys_ver(),
-            'vivado': super(VivadoYosys, self).versions()
-        }
+        return {'yosys': self.yosys_ver(), 'vivado': self.vivado_ver()}

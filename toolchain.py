@@ -27,10 +27,13 @@ class Toolchain:
         self.pcf = None
         self.sdc = None
         self.xdc = None
+        self.params_file = None
+        self.params_string = None
         self._strategy = None
         self._carry = None
         self.seed = None
         self.build = None
+        self.build_type = None
         self.date = datetime.datetime.utcnow()
 
         self.family = None
@@ -43,6 +46,7 @@ class Toolchain:
         self.srcs = None
         self.top = None
         self.out_dir = None
+        self.clocks = None
 
         with Timed(self, 'nop'):
             subprocess.check_call("true", shell=True, cwd=self.out_dir)
@@ -51,30 +55,22 @@ class Toolchain:
         return [os.path.realpath(self.rootdir + '/' + fn) for fn in fns]
 
     def optstr(self):
-        ret = ''
-
-        def add(s):
-            nonlocal ret
-
-            if ret:
-                ret += '_' + s
-            else:
-                ret = s
+        tokens = []
 
         if self.pcf:
-            add('pcf')
+            tokens.append('pcf')
         if self.sdc:
-            add('sdc')
+            tokens.append('sdc')
         if self.xdc:
-            add('xdc')
+            tokens.append('xdc')
         # omit carry if not explicitly given?
         if self.carry is not None:
-            add('carry-%c' % ('y' if self.carry else 'n', ))
+            tokens.append('carry-%c' % ('y' if self.carry else 'n', ))
         if self.strategy:
-            add(self.strategy)
+            tokens.append(self.strategy)
         if self.seed:
-            add('seed-%08X' % (self.seed, ))
-        return ret
+            tokens.append('seed-%08X' % (self.seed, ))
+        return '_'.join(tokens)
 
     def add_runtime(self, name, dt, parent=None):
         if parent is None:
@@ -92,9 +88,17 @@ class Toolchain:
             self.project_name, self.toolchain, self.family, self.part,
             self.board
         )
+
+        if self.build_type:
+            ret += '_' + self.build_type
+
+        if self.build:
+            ret += '_' + self.build
+
         op = self.optstr()
         if op:
             ret += '_' + op
+
         return ret
 
     @property
@@ -154,6 +158,8 @@ class Toolchain:
         device,
         package,
         board,
+        params_file,
+        params_string,
         out_dir=None,
         out_prefix=None,
     ):
@@ -163,12 +169,18 @@ class Toolchain:
         self.part = "".join((device, package))
         self.board = board
 
+        self.params_file = params_file
+        self.params_string = params_string
+
         self.project_name = project['name']
         self.srcs = self.canonicalize(project['srcs'])
         for src in self.srcs:
             if not os.path.exists(src):
                 raise ValueError("Missing source file %s" % src)
         self.top = project['top']
+
+        if 'clocks' in project:
+            self.clocks = project['clocks']
 
         out_prefix = out_prefix or 'build'
         if not os.path.exists(out_prefix):
@@ -215,6 +227,48 @@ class Toolchain:
                 env=env
             )
 
+    def get_runtimes(self):
+        """Returns a standard runtime dictionary.
+
+        Different tools have different names for the various EDA steps and,
+        to generate a uniform data structure, these steps must fall into the correct
+        standard category."""
+
+        RUNTIME_ALIASES = {
+            'prepare': ['prepare'],
+            'synthesis': ['synth_design', 'synth', 'synthesis'],
+            'optimization': ['opt_design'],
+            'packing': ['pack'],
+            'placement': ['place', 'place_design'],
+            'routing': ['route', 'route_design'],
+            'fasm': ['fasm'],
+            'checkpoint': ['open_checkpoint'],
+            'bitstream': ['write_bitstream', 'bitstream'],
+            'reports': ['report_power', 'report_methodology', 'report_drc'],
+            'total': ['total'],
+            'nop': ['nop'],
+            'fasm2bels': ['fasm2bels'],
+        }
+
+        def get_standard_runtime(runtime):
+            for k, v in RUNTIME_ALIASES.items():
+                for alias in v:
+                    if runtime == alias:
+                        return k
+
+            assert False, "Couldn't find the standard name for {}".format(
+                runtime
+            )
+
+        runtimes = {k: None for k in RUNTIME_ALIASES.keys()}
+
+        for k, v in self.runtimes.items():
+            runtime = get_standard_runtime(k)
+
+            runtimes[runtime] = round(v, 3)
+
+        return runtimes
+
     def write_metadata(self, all=True):
         out_dir = self.out_dir
 
@@ -248,19 +302,24 @@ class Toolchain:
             'carry': self.carry,
             'seed': self.seed,
             'build': self.build,
+            'build_type': self.build_type,
             'date': date_str,
             'toolchain': self.toolchain,
             'strategy': self.strategy,
+            'parameters': self.params_file or self.params_string,
 
             # canonicalize
             'sources': [x.replace(os.getcwd(), '.') for x in self.srcs],
             'top': self.top,
-            "runtime": self.runtimes,
+            "runtime": self.get_runtimes(),
             "max_freq": max_freq,
             "resources": resources,
-            "verions": self.versions(),
+            "versions": self.versions(),
             "cmds": self.cmds,
         }
+
+        print
+
         with open(out_dir + '/meta.json', 'w') as f:
             json.dump(j, f, sort_keys=True, indent=4)
 

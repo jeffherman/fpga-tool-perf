@@ -1,0 +1,31 @@
+{
+    "srcs": [
+        "src/blinky/blinky.v"
+        ],
+    "top": "top",
+    "name": "blinky",
+    "clocks": {
+        "clk_i": 10.0
+    },
+    "toolchains": {
+        "vpr": {
+            "arty": ["arty.pcf"]
+        },
+        "vpr-fasm2bels": {
+            "arty": ["arty.pcf"]
+        },
+        "nextpnr-xilinx": {
+            "arty": ["arty.xdc"]
+        },
+        "nextpnr-xilinx-fasm2bels": {
+            "arty": ["arty.xdc", "arty.pcf"]
+        },
+        "vivado": {
+            "arty": ["arty.xdc"]
+        },
+        "vivado-yosys": {
+            "arty": ["arty.xdc"]
+        }
+    }
+}
+

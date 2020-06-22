@@ -16,11 +16,12 @@ from terminaltables import AsciiTable
 from toolchain import Toolchain
 from utils import Timed
 
-from icestorm import Nextpnr
+from icestorm import NextpnrIcestorm
 from icestorm import Arachne
 from vivado import Vivado
 from vivado import VivadoYosys
-from symbiflow import VPR
+from symbiflow import VPR, NextpnrXilinx
+from fasm2bels import VPRFasm2Bels, NextpnrXilinxFasm2Bels
 from radiant import RadiantSynpro
 from radiant import RadiantLSE
 from icecube import Icecube2Synpro
@@ -29,34 +30,12 @@ from icecube import Icecube2Yosys
 
 # to find data files
 root_dir = os.path.dirname(os.path.abspath(__file__))
-project_dir = root_dir + '/project'
-src_dir = root_dir + '/src'
+project_dir = os.path.join(root_dir, 'project')
+src_dir = os.path.join(root_dir, 'src')
 
 
 class NotAvailable:
     pass
-
-
-# https://stackoverflow.com/questions/377017/test-if-executable-exists-in-python
-def which(program):
-    def is_exe(fpath):
-        return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
-
-    fpath, fname = os.path.split(program)
-    if fpath:
-        if is_exe(program):
-            return program
-    else:
-        for path in os.environ["PATH"].split(os.pathsep):
-            exe_file = os.path.join(path, program)
-            if is_exe(exe_file):
-                return exe_file
-
-    return None
-
-
-def have_exec(mybin):
-    return which(mybin) != None
 
 
 def print_stats(t):
@@ -103,7 +82,8 @@ def print_stats(t):
         for cd in max_freq:
             actual = "%0.3f MHz" % (max_freq[cd]['actual'] / 1e6)
             requested = "%0.3f MHz" % (max_freq[cd]['requested'] / 1e6)
-            met = max_freq[cd]['met']
+            met = "unknown" if max_freq[cd]['met'] is None else max_freq[cd][
+                'met']
             s_violation = ("%0.3f ns" % max_freq[cd]['setup_violation'])
             h_violation = ("%0.3f ns" % max_freq[cd]['hold_violation'])
             table_data.append(
@@ -115,13 +95,9 @@ def print_stats(t):
 
     print_section_header('Toolchain Run-Times')
     table_data = [['Stage', 'Run Time (seconds)']]
-    for k, v in t.runtimes.items():
-        if type(v) is collections.OrderedDict:
-            table_data.append([k, ""])
-            for k1, v1 in v.items():
-                table_data.append(["    " + k1, ("%0.3f" % v1)])
-        else:
-            table_data.append([k, ("%0.3f" % v)])
+    for k, v in t.get_runtimes().items():
+        value = "%0.3f" % v if v else "N/A"
+        table_data.append([k, value])
 
     table = AsciiTable(table_data)
     print(table.table)
@@ -130,7 +106,8 @@ def print_stats(t):
     table_data = [['Resource', 'Used']]
 
     for k, v in sorted(t.resources().items()):
-        table_data.append([k, v])
+        value = v if v else "N/A"
+        table_data.append([k, value])
 
     table = AsciiTable(table_data)
     print(table.table)
@@ -139,9 +116,11 @@ def print_stats(t):
 toolchains = {
     'vivado': Vivado,
     'vivado-yosys': VivadoYosys,
-    'arachne': Arachne,
     'vpr': VPR,
-    'nextpnr': Nextpnr,
+    'vpr-fasm2bels': VPRFasm2Bels,
+    'nextpnr-ice40': NextpnrIcestorm,
+    'nextpnr-xilinx': NextpnrXilinx,
+    'nextpnr-xilinx-fasm2bels': NextpnrXilinxFasm2Bels,
     'icecube2-synpro': Icecube2Synpro,
     'icecube2-lse': Icecube2LSE,
     'icecube2-yosys': Icecube2Yosys,
@@ -153,26 +132,35 @@ toolchains = {
 
 
 def run(
-    family,
-    device,
-    package,
     board,
     toolchain,
     project,
+    params_file=None,
+    params_string=None,
     out_dir=None,
     out_prefix=None,
     verbose=False,
     strategy=None,
     seed=None,
     carry=None,
-    build=None
+    build=None,
+    build_type=None,
 ):
-    assert family == 'ice40' or family == 'xc7'
-    assert device is not None
-    assert package is not None
     assert board is not None
     assert toolchain is not None
     assert project is not None
+
+    project_dict = get_project(project)
+    with open(os.path.join(root_dir, 'boards', 'boards.json'), 'r') as boards:
+        boards_info = json.load(boards)
+
+    board_info = boards_info[board]
+    family = board_info['family']
+    device = board_info['device']
+    package = board_info['package']
+
+    assert family == 'ice40' or family == 'xc7'
+
     # some toolchains use signed 32 bit
     assert seed is None or 1 <= seed <= 0x7FFFFFFF
 
@@ -183,22 +171,31 @@ def run(
     t.carry = carry
 
     # Constraint files shall be in their directories
-    pcf = get_pcf(project, family, device, package, board, toolchain)
-    sdc = get_sdc(project, family, device, package, board, toolchain)
-    xdc = get_xdc(project, family, device, package, board, toolchain)
+    pcf = get_constraint(
+        project, board, project_dict['toolchains'][toolchain][board], 'pcf'
+    )
+    sdc = get_constraint(
+        project, board, project_dict['toolchains'][toolchain][board], 'sdc'
+    )
+    xdc = get_constraint(
+        project, board, project_dict['toolchains'][toolchain][board], 'xdc'
+    )
 
     # XXX: sloppy path handling here...
     t.pcf = os.path.realpath(pcf) if pcf else None
     t.sdc = os.path.realpath(sdc) if sdc else None
     t.xdc = os.path.realpath(xdc) if xdc else None
     t.build = build
+    t.build_type = build_type
 
     t.project(
-        get_project(project),
+        project_dict,
         family,
         device,
         package,
         board,
+        params_file,
+        params_string,
         out_dir=out_dir,
         out_prefix=out_prefix,
     )
@@ -225,7 +222,9 @@ def matching_pattern(path, pattern):
 
 def get_projects():
     '''Query all supported projects'''
-    return matching_pattern(project_dir + '/*.json', '/.*/(.*)[.]json')
+    return matching_pattern(
+        os.path.join(project_dir, '*.json'), '/.*/(.*)[.]json'
+    )
 
 
 def list_projects():
@@ -271,38 +270,23 @@ def env_ready():
     return True
 
 
-def get_constraint(
-    project, family, device, package, board, toolchain, extension
-):
-    constraint = "_".join((family, device, package, board)
-                          ) + ".{}".format(extension)
-    path = os.path.join(src_dir, project, 'constr', toolchain, constraint)
-    if (os.path.exists(path)):
-        return path
-    else:
+def get_constraint(project, board, constr_list, extension):
+    constr_file = [v for v in constr_list if v.endswith(extension)]
+
+    if not constr_file:
         return None
 
+    assert len(constr_file) == 1
 
-def get_pcf(project, family, device, package, board, toolchain):
-    return get_constraint(
-        project, family, device, package, board, toolchain, 'pcf'
-    )
+    path = os.path.join(src_dir, project, 'constr', constr_file[0])
+    if (os.path.exists(path)):
+        return path
 
-
-def get_sdc(project, family, device, package, board, toolchain):
-    return get_constraint(
-        project, family, device, package, board, toolchain, 'sdc'
-    )
-
-
-def get_xdc(project, family, device, package, board, toolchain):
-    return get_constraint(
-        project, family, device, package, board, toolchain, 'xdc'
-    )
+    assert False, "No constraint file found"
 
 
 def get_project(name):
-    project_fn = project_dir + '/' + name + '.json'
+    project_fn = os.path.join(project_dir, '{}.json'.format(name))
     with open(project_fn, 'r') as f:
         return json.load(f)
 
@@ -328,10 +312,13 @@ def main():
 
     parser.add_argument('--verbose', action='store_true', help='')
     parser.add_argument('--overwrite', action='store_true', help='')
-    parser.add_argument('--family', default=None, help='FPGA family')
-    parser.add_argument('--device', default=None, help='FPGA Device')
-    parser.add_argument('--package', default=None, help='FPGA Package')
     parser.add_argument('--board', default=None, help='Target board')
+    parser.add_argument(
+        '--params_file', default=None, help='Use custom tool parameters'
+    )
+    parser.add_argument(
+        '--params_string', default=None, help='Use custom tool parameters'
+    )
     parser.add_argument(
         '--strategy', default=None, help='Optimization strategy'
     )
@@ -367,7 +354,10 @@ def main():
         help='Auto named directory prefix (default: build)'
     )
     parser.add_argument('--build', default=None, help='Build number')
+    parser.add_argument('--build_type', default=None, help='Build type')
     args = parser.parse_args()
+
+    assert not (args.params_file and args.params_string)
 
     if args.list_toolchains:
         list_toolchains()
@@ -379,12 +369,6 @@ def main():
         check_env(args.toolchain)
     else:
         argument_errors = []
-        if args.family is None:
-            argument_errors.append('--family argument required')
-        if args.device is None:
-            argument_errors.append('--device argument required')
-        if args.package is None:
-            argument_errors.append('--package argument required')
         if args.board is None:
             argument_errors.append('--board argument required')
         if args.toolchain is None:
@@ -400,19 +384,19 @@ def main():
 
         seed = int(args.seed, 0) if args.seed else None
         run(
-            args.family,
-            args.device,
-            args.package,
             args.board,
             args.toolchain,
             args.project,
+            params_file=args.params_file,
+            params_string=args.params_string,
             out_dir=args.out_dir,
             out_prefix=args.out_prefix,
+            verbose=args.verbose,
             strategy=args.strategy,
             carry=args.carry,
             seed=seed,
             build=args.build,
-            verbose=args.verbose
+            build_type=args.build_type
         )
 
 
